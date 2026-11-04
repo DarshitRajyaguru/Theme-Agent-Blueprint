@@ -39,12 +39,13 @@ final class TAB_Dynamic_Template {
 		}
 
 		self::remove_source_chrome( $xpath, $root );
-		foreach ( $xpath->query( './/*[@data-tab-field or @data-tab-type or @data-tab-repeater or @data-tab-ignore]', $root ) as $node ) {
+		foreach ( $xpath->query( './/*[@data-tab-field or @data-tab-type or @data-tab-repeater or @data-tab-ignore or @data-tab-source-order]', $root ) as $node ) {
 			if ( $node instanceof DOMElement ) {
 				$node->removeAttribute( 'data-tab-field' );
 				$node->removeAttribute( 'data-tab-type' );
 				$node->removeAttribute( 'data-tab-repeater' );
 				$node->removeAttribute( 'data-tab-ignore' );
+				$node->removeAttribute( 'data-tab-source-order' );
 			}
 		}
 		$output = '';
@@ -265,19 +266,18 @@ final class TAB_Dynamic_Template {
 
 	private function process_scalars( $document, $xpath, $section, $base ) {
 		$nodes = $this->editable_nodes( $xpath, $section );
-		$counts = array();
 		foreach ( $nodes as $descriptor ) {
 			$node = $descriptor['node'];
 			if ( $this->has_dynamic_ancestor( $node, $section ) ) {
 				continue;
 			}
 			$kind = $descriptor['kind'];
-			$counts[ $kind ] = isset( $counts[ $kind ] ) ? $counts[ $kind ] + 1 : 1;
 			$requested_name = $node->getAttribute( 'data-tab-field' );
 			$semantic_name = $this->semantic_node_name( $node, $kind );
 			$context_name = $this->node_context_name( $node );
 			$name = $this->unique_name( $requested_name ? $requested_name : $base . ( $context_name ? '_' . $context_name : '' ) . '_' . $semantic_name );
-			$field = $this->make_field( $name, $this->label_from_name( $semantic_name ), $this->acf_type( $kind ), $this->node_default( $descriptor ) );
+			$label_seed = $requested_name ? $requested_name : trim( $context_name . '_' . $semantic_name, '_' );
+			$field = $this->make_field( $name, $this->label_from_name( $label_seed ), $this->acf_type( $kind ), $this->node_default( $descriptor ) );
 			$field['_tab_order'] = $this->source_node_order( $node );
 			$this->fields[] = $field;
 			$this->dynamicize_node( $document, $descriptor, $name, false );
@@ -289,7 +289,18 @@ final class TAB_Dynamic_Template {
 		$query .= ' | .//div[contains(concat(" ", normalize-space(@class), " "), " small-title ") or contains(concat(" ", normalize-space(@class), " "), " description ")]';
 		$query .= ' | .//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6 or self::p or self::blockquote or self::figcaption or self::li]';
 		$descriptors = array();
+		$selected_containers = array();
 		foreach ( $xpath->query( $query, $root ) as $node ) {
+			$parent = $node->parentNode;
+			$nested_in_selected = false;
+			while ( $parent instanceof DOMElement && $parent !== $root ) {
+				if ( isset( $selected_containers[ spl_object_id( $parent ) ] ) ) {
+					$nested_in_selected = true;
+					break;
+				}
+				$parent = $parent->parentNode;
+			}
+			if ( $nested_in_selected ) continue;
 			if ( $node->hasAttribute( 'data-tab-dynamic' ) || $node->hasAttribute( 'data-tab-ignore' ) || $xpath->query( 'ancestor::*[@data-tab-dynamic or @data-tab-ignore]', $node )->length ) {
 				continue;
 			}
@@ -297,9 +308,13 @@ final class TAB_Dynamic_Template {
 			if ( ! $explicit && $this->has_runtime_binding( $xpath, $node ) ) {
 				continue;
 			}
-			$nested_editable = $xpath->query( './/a | .//img | .//span[normalize-space(.) != ""] | .//button | .//input | .//select | .//textarea | .//*[@data-tab-field or @data-tab-type]', $node )->length;
+			// A heading or description with <span>, <strong>, <em>, etc. is ONE rich field.
+			// Converting its child spans separately destroys the intended heading and order.
+			$inline_content = $this->has_inline_markup_only( $xpath, $node );
+			$nested_editable = $xpath->query( './/a | .//img | .//button | .//input | .//select | .//textarea | .//*[@data-tab-field or @data-tab-type]', $node )->length;
 			$nested_data_hooks = $xpath->query( './/*/@*[starts-with(name(), "data-")]', $node )->length;
-			if ( ! $explicit && 'img' !== strtolower( $node->tagName ) && ( $nested_editable || $nested_data_hooks || $xpath->query( './*', $node )->length ) ) {
+			$has_children = $xpath->query( './*', $node )->length > 0;
+			if ( ! $explicit && 'img' !== strtolower( $node->tagName ) && ( $nested_editable || ( $nested_data_hooks && ! $has_children ) || ( $has_children && ! $inline_content ) ) ) {
 				continue;
 			}
 			$text = trim( preg_replace( '/\s+/', ' ', $node->textContent ) );
@@ -307,12 +322,33 @@ final class TAB_Dynamic_Template {
 				continue;
 			}
 			$kind = $this->node_kind( $node );
-			if ( ! in_array( $kind, array( 'image', 'link', 'file', 'url' ), true ) && $xpath->query( './*', $node )->length ) {
+			if ( ! in_array( $kind, array( 'image', 'link', 'file', 'url' ), true ) && $has_children ) {
 				$kind = 'rich_text';
 			}
 			$descriptors[] = array( 'node' => $node, 'kind' => $kind );
+			if ( $has_children && $inline_content ) {
+				$selected_containers[ spl_object_id( $node ) ] = true;
+			}
 		}
 		return $descriptors;
+	}
+
+	private function has_inline_markup_only( $xpath, $node ) {
+		$tag = strtolower( $node->tagName );
+		if ( ! preg_match( '/^h[1-6]$/', $tag ) && ! in_array( $tag, array( 'p', 'blockquote', 'figcaption', 'div', 'span', 'label' ), true ) ) {
+			return false;
+		}
+		$elements = $xpath->query( './/*', $node );
+		if ( ! $elements->length ) return false;
+		$allowed = array( 'span', 'strong', 'b', 'em', 'i', 'mark', 'small', 'sup', 'sub', 'br', 'u', 'code' );
+		foreach ( $elements as $child ) {
+			if ( ! in_array( strtolower( $child->tagName ), $allowed, true ) ) return false;
+			if ( $child->hasAttribute( 'data-tab-field' ) || $child->hasAttribute( 'data-tab-type' ) ) return false;
+			foreach ( $child->attributes as $attr ) {
+				if ( 0 === strpos( strtolower( $attr->name ), 'data-' ) && 'data-tab-source-order' !== strtolower( $attr->name ) ) return false;
+			}
+		}
+		return true;
 	}
 
 	private function matching_sets( $sets ) {
@@ -435,6 +471,11 @@ final class TAB_Dynamic_Template {
 			$field['rows'] = 4;
 			$field['new_lines'] = '';
 			$field['default_value'] = is_scalar( $default ) ? $default : '';
+		} elseif ( 'wysiwyg' === $type ) {
+			$field['tabs'] = 'all'; // Both Visual and Text editing modes.
+			$field['toolbar'] = 'full';
+			$field['media_upload'] = 1;
+			$field['default_value'] = is_scalar( $default ) ? $default : '';
 		} elseif ( 'text' === $type ) {
 			$field['default_value'] = is_scalar( $default ) ? wp_strip_all_tags( $default ) : '';
 		}
@@ -451,6 +492,9 @@ final class TAB_Dynamic_Template {
 	private function acf_type( $kind ) {
 		if ( in_array( $kind, array( 'image', 'link', 'file', 'url', 'text', 'textarea', 'wysiwyg' ), true ) ) {
 			return $kind;
+		}
+		if ( 'rich_text' === $kind || 'quote' === $kind ) {
+			return 'wysiwyg';
 		}
 		return in_array( $kind, array( 'heading', 'label', 'list_item' ), true ) ? 'text' : 'textarea';
 	}
@@ -549,6 +593,9 @@ final class TAB_Dynamic_Template {
 	private function semantic_node_name( $node, $kind ) {
 		$classes = preg_split( '/\s+/', trim( $node->getAttribute( 'class' ) ) );
 		$class_string = implode( ' ', $classes );
+		if ( false !== strpos( $class_string, 'small-title' ) || false !== strpos( $class_string, 'eyebrow' ) ) {
+			return 'eyebrow';
+		}
 		if ( false !== strpos( $class_string, 'privacy-note' ) ) {
 			return 'privacy_note';
 		}
@@ -602,17 +649,16 @@ final class TAB_Dynamic_Template {
 	}
 
 	private function index_source_order( $section ) {
-		$this->source_order = array();
+		// Stable source markers survive XPath wrapper changes and repeater DOM mutations.
 		$index = 0;
 		$nodes = array_merge( array( $section ), iterator_to_array( $section->getElementsByTagName( '*' ) ) );
 		foreach ( $nodes as $node ) {
-			$this->source_order[ spl_object_id( $node ) ] = $index++;
+			$node->setAttribute( 'data-tab-source-order', (string) $index++ );
 		}
 	}
 
 	private function source_node_order( $node ) {
-		$id = spl_object_id( $node );
-		return isset( $this->source_order[ $id ] ) ? $this->source_order[ $id ] : PHP_INT_MAX;
+		return $node instanceof DOMElement && $node->hasAttribute( 'data-tab-source-order' ) ? (int) $node->getAttribute( 'data-tab-source-order' ) : PHP_INT_MAX;
 	}
 
 	private function sort_section_fields( $field_start ) {
@@ -743,7 +789,9 @@ final class TAB_Dynamic_Template {
 		foreach ( $node->childNodes as $child ) {
 			$html .= $node->ownerDocument->saveHTML( $child );
 		}
-		return $html;
+		// Source-order markers are internal bookkeeping, never editor default values.
+		// This matters for headings such as <h1>Save with <span>AI</span></h1>.
+		return preg_replace( '/\sdata-tab-source-order=(?:"[^"]*"|\'[^\']*\')/i', '', $html );
 	}
 
 	private function has_dynamic_ancestor( $node, $limit ) {
@@ -758,12 +806,13 @@ final class TAB_Dynamic_Template {
 	}
 
 	private function remove_markers( $xpath, $root ) {
-		foreach ( $xpath->query( './/*[@data-tab-dynamic or @data-tab-field or @data-tab-type or @data-tab-repeater or @data-tab-ignore]', $root ) as $node ) {
+		foreach ( $xpath->query( './/*[@data-tab-dynamic or @data-tab-field or @data-tab-type or @data-tab-repeater or @data-tab-ignore or @data-tab-source-order]', $root ) as $node ) {
 			$node->removeAttribute( 'data-tab-dynamic' );
 			$node->removeAttribute( 'data-tab-field' );
 			$node->removeAttribute( 'data-tab-type' );
 			$node->removeAttribute( 'data-tab-repeater' );
 			$node->removeAttribute( 'data-tab-ignore' );
+			$node->removeAttribute( 'data-tab-source-order' );
 		}
 	}
 

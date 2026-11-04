@@ -9,7 +9,8 @@
 		function createProgress(title, detail) {
 			var overlay = document.createElement('div');
 			overlay.className = 'tab-progress-overlay';
-			overlay.innerHTML = '<div class="tab-progress-dialog" role="status" aria-live="polite"><div class="tab-progress-orb"><div class="tab-progress-water"></div><span class="dashicons dashicons-media-document" aria-hidden="true"></span><strong>0%</strong></div><h2></h2><p></p><div class="tab-progress-track"><span></span></div></div>';
+			overlay.setAttribute('aria-hidden', 'false');
+			overlay.innerHTML = '<div class="tab-progress-dialog" role="status" aria-live="polite"><div class="tab-progress-orb"><div class="tab-progress-glow"></div><div class="tab-progress-water"></div><div class="tab-progress-ripple"></div><div class="tab-progress-bubbles" aria-hidden="true"><span></span><span></span><span></span></div><span class="dashicons dashicons-admin-generic" aria-hidden="true"></span><strong>0%</strong></div><h2></h2><p></p><div class="tab-progress-track"><span></span></div></div>';
 			overlay.querySelector('h2').textContent = title;
 			overlay.querySelector('p').textContent = detail;
 			document.body.appendChild(overlay);
@@ -26,8 +27,28 @@
 		}
 
 		function closeProgress(overlay) {
+			if (!overlay) return;
 			overlay.classList.remove('is-visible');
+			overlay.setAttribute('aria-hidden', 'true');
 			window.setTimeout(function () { overlay.remove(); }, 180);
+		}
+
+		function showPassiveProgress(title, detail) {
+			var overlay = createProgress(title, detail);
+			var percent = 14;
+			setProgress(overlay, percent, detail);
+			var timer = window.setInterval(function () {
+				percent = Math.min(78, percent + (percent < 52 ? 9 : 4));
+				setProgress(overlay, percent, detail);
+			}, 420);
+			return {
+				overlay: overlay,
+				stop: function () {
+					window.clearInterval(timer);
+					setProgress(overlay, 100, 'Done.');
+					window.setTimeout(function () { closeProgress(overlay); }, 250);
+				}
+			};
 		}
 
 		function formEndpoint(form) {
@@ -120,6 +141,7 @@
 				form.addEventListener('submit', function () {
 					var button = form.querySelector('button[type="submit"]');
 					if (button) { button.disabled = true; button.classList.add('is-busy'); button.innerHTML = '<span class="dashicons dashicons-update" aria-hidden="true"></span><span>Saving profile...</span>'; }
+					showPassiveProgress('Saving project profile', 'Updating theme agent settings...');
 				});
 			}
 			var importForm = root.querySelector('.tab-import-form');
@@ -138,7 +160,13 @@
 				historyForm.addEventListener('submit', function (event) {
 					var button = historyForm.querySelector('button[type="submit"]');
 					if (button && button.dataset.confirm && !window.confirm(button.dataset.confirm)) { event.preventDefault(); return; }
-					if (button) { button.disabled = true; button.classList.add('is-busy'); button.innerHTML = '<span class="dashicons dashicons-update" aria-hidden="true"></span><span>Working...</span>'; }
+					if (button) {
+						button.disabled = true;
+						button.classList.add('is-busy');
+						button.innerHTML = '<span class="dashicons dashicons-update" aria-hidden="true"></span><span>Working...</span>';
+					}
+					var isRestore = !!(button && button.classList.contains('tab-restore-button'));
+					showPassiveProgress(isRestore ? 'Restoring template' : 'Revoking template', isRestore ? 'Re-applying tracked files and shared assets...' : 'Removing tracked files and shared asset blocks...');
 				});
 			});
 		}
@@ -174,10 +202,11 @@
 			}
 			viewContent.classList.add('is-loading');
 			viewContent.setAttribute('aria-busy', 'true');
+			var progress = showPassiveProgress(view === 'history' ? 'Opening template history' : 'Loading project profile', view === 'history' ? 'Retrieving saved templates and restore actions...' : 'Loading current theme settings...');
 			return fetchView(view, link.href).then(function (html) {
 				viewContent.innerHTML = html; setActiveView(view); bindForms(viewContent);
 				if (pushState) window.history.pushState({ tabView: view }, '', link.href);
-			}).catch(function () { window.location.assign(link.href); }).finally(function () { viewContent.classList.remove('is-loading'); viewContent.removeAttribute('aria-busy'); });
+			}).catch(function () { window.location.assign(link.href); }).finally(function () { progress.stop(); viewContent.classList.remove('is-loading'); viewContent.removeAttribute('aria-busy'); });
 		}
 
 		var hero = document.querySelector('.tab-wrap > .tab-hero');

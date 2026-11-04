@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Theme Agent Blueprint
  * Description: Creates theme-aware development playbooks and imports HTML designs as dynamic SCF/ACF WordPress templates.
- * Version: 1.6.1
+ * Version: 1.7.1
  * Requires at least: 6.2
  * Requires PHP: 7.4
  * Author: Darshit Rajyaguru
@@ -20,7 +20,7 @@ require_once __DIR__ . '/includes/class-tab-template-importer.php';
 final class TAB_Theme_Agent_Blueprint_V111 {
 	const OPTION = 'tab_blueprint_settings';
 	const SLUG   = 'theme-agent-blueprint';
-	const VERSION = '1.6.1';
+	const VERSION = '1.7.1';
 
 	public static function init() {
 		add_action( 'admin_menu', array( __CLASS__, 'admin_menu' ) );

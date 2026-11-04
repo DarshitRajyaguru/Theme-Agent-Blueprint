@@ -78,10 +78,16 @@ final class TAB_Template_Importer {
 		) );
 
 		$theme_root = wp_normalize_path( get_stylesheet_directory() );
-		$media = self::prepare_media( $entries, $settings, $theme_root );
-		$assets = self::extract_html_assets( $entries[ $html_path ], $html_path, $entries, $media['map'] );
-		$css = self::build_css( $assets['styles'], $entries, $media['map'] );
-		$js  = self::build_js( $assets['scripts'], $slug );
+		$assets = self::extract_html_assets( $entries[ $html_path ], $html_path, $entries, array() );
+		// Inspect only the page content that will actually be placed in the template.
+		// Never use the source header, footer, or commented-out markup to select assets.
+		$retained_body = TAB_Dynamic_Template::prepare_static( $assets['html'] );
+		$usage = self::collect_body_usage_context( $retained_body );
+		$required_media = self::referenced_media( $retained_body, $html_path, $assets['styles'], $usage, $assets['scripts'], $entries );
+		$media = self::prepare_media( $entries, $settings, $theme_root, $required_media );
+		$css = self::build_css( $assets['styles'], $media['map'], $usage, $slug );
+		$skipped_scripts = 0;
+		$js  = self::build_js( $assets['scripts'], $slug, $usage, $skipped_scripts );
 
 		$template_dir = self::theme_path( $settings['sections_dir'], $theme_root, true );
 		$template_path = $template_dir . '/template-' . $slug . '.php';
@@ -94,20 +100,26 @@ final class TAB_Template_Importer {
 			$dynamic = TAB_Dynamic_Template::convert( $assets['html'], $slug, $html_path, $media['map'], $template_relative );
 			$body = strtr( self::rewrite_html_media( $dynamic['html'], $html_path, $media['map'] ), $dynamic['tokens'] );
 		} else {
-			$body = self::rewrite_html_media( TAB_Dynamic_Template::prepare_static( $assets['html'] ), $html_path, $media['map'] );
+			$body = self::rewrite_html_media( $retained_body, $html_path, $media['map'] );
 		}
 
 		$writes = $media['writes'];
 		$blocks = array();
 		if ( '' !== trim( $css ) ) {
 			$css_path = self::asset_target( $settings['css_files'], array( 'assets/css/custom.css', 'style.css' ), $theme_root, 'css' );
-			$writes[ $css_path ] = self::append_asset( $css_path, $css, 'CSS', $slug );
-			$blocks[ $css_path ] = 'CSS';
+			$css_append = self::append_asset( $css_path, $css, 'CSS', $slug );
+			if ( $css_append['appended'] ) {
+				$writes[ $css_path ] = $css_append['content'];
+				$blocks[ $css_path ] = 'CSS';
+			}
 		}
 		if ( '' !== trim( $js ) ) {
 			$js_path = self::asset_target( $settings['js_files'], array( 'assets/js/custom.js' ), $theme_root, 'js' );
-			$writes[ $js_path ] = self::append_asset( $js_path, $js, 'JS', $slug );
-			$blocks[ $js_path ] = 'JS';
+			$js_append = self::append_asset( $js_path, $js, 'JS', $slug );
+			if ( $js_append['appended'] ) {
+				$writes[ $js_path ] = $js_append['content'];
+				$blocks[ $js_path ] = 'JS';
+			}
 		}
 
 		$template = "<?php\n/**\n * Template Name: " . str_replace( '*/', '', $template_name ) . "\n */\n\ndefined( 'ABSPATH' ) || exit;\n\n";
@@ -141,12 +153,13 @@ final class TAB_Template_Importer {
 			throw $exception;
 		}
 
+		$warning = self::import_warnings( $assets, $skipped_scripts );
 		if ( ! $dynamic ) {
 			return sprintf(
 				/* translators: %s: template path */
 				__( 'Static template imported to %s. Content remains in the generated template, and assets were merged into the configured shared locations.', 'theme-agent-blueprint' ),
 				str_replace( $theme_root . '/', '', $template_path )
-			);
+			) . $warning;
 		}
 
 		return sprintf(
@@ -154,7 +167,27 @@ final class TAB_Template_Importer {
 			__( 'Dynamic template imported to %1$s with %2$d custom-field definitions. Source values remain as fallbacks, and assets were merged into the configured shared locations.', 'theme-agent-blueprint' ),
 			str_replace( $theme_root . '/', '', $template_path ),
 			(int) $dynamic['field_count']
-		);
+		) . $warning;
+	}
+
+
+	private static function import_warnings( $assets, $skipped_scripts ) {
+		$messages = array();
+		if ( ! empty( $assets['dependencies'] ) ) {
+			$messages[] = sprintf(
+				/* translators: %s: CSS and JS dependency filenames */
+				__( 'External/vendor assets were not copied: %s. Verify the active theme enqueues any required libraries and fonts.', 'theme-agent-blueprint' ),
+				implode( ', ', array_slice( array_unique( $assets['dependencies'] ), 0, 12 ) )
+			);
+		}
+		if ( $skipped_scripts ) {
+			$messages[] = sprintf(
+				/* translators: %d: number of scripts that could not be scoped safely */
+				_n( '%d JavaScript block was excluded because it could not be safely linked to this template.', '%d JavaScript blocks were excluded because they could not be safely linked to this template.', $skipped_scripts, 'theme-agent-blueprint' ),
+				$skipped_scripts
+			);
+		}
+		return $messages ? ' ' . implode( ' ', $messages ) : '';
 	}
 
 	private static function template_helpers() {
@@ -326,13 +359,17 @@ PHP;
 		return reset( $html_files );
 	}
 
-	private static function prepare_media( $entries, $settings, $theme_root ) {
+	private static function prepare_media( $entries, $settings, $theme_root, $required = null ) {
 		$image_extensions = array( 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'avif', 'ico' );
 		$font_extensions  = array( 'woff', 'woff2', 'ttf', 'otf', 'eot' );
 		$map = array();
 		$writes = array();
 		$used = array();
+		$content_targets = array();
 		foreach ( $entries as $source => $content ) {
+			if ( is_array( $required ) && ! isset( $required[ $source ] ) ) {
+				continue;
+			}
 			$extension = strtolower( pathinfo( $source, PATHINFO_EXTENSION ) );
 			if ( in_array( $extension, $image_extensions, true ) ) {
 				$directory = self::theme_path( $settings['images_dir'], $theme_root, true );
@@ -343,57 +380,123 @@ PHP;
 			} else {
 				continue;
 			}
-			$filename = sanitize_file_name( basename( $source ) );
-			if ( isset( $used[ strtolower( $directory . '/' . $filename ) ] ) ) {
-				$filename = pathinfo( $filename, PATHINFO_FILENAME ) . '-' . substr( md5( $source ), 0, 8 ) . '.' . $extension;
+
+			if ( 'svg' === $extension && preg_match( '/<\s*(?:script|foreignObject|iframe)\b|\bon[a-z]+\s*=|javascript\s*:|<\?php/i', $content ) ) {
+				throw new RuntimeException( __( 'The ZIP contains an unsafe SVG with scripts or active content. Remove or sanitize it before importing.', 'theme-agent-blueprint' ) );
 			}
-			$used[ strtolower( $directory . '/' . $filename ) ] = true;
-			$destination = $directory . '/' . $filename;
-			if ( file_exists( $destination ) && md5_file( $destination ) !== md5( $content ) ) {
-				$filename = pathinfo( $filename, PATHINFO_FILENAME ) . '-' . substr( md5( $content ), 0, 8 ) . '.' . $extension;
-				$destination = $directory . '/' . $filename;
+			$content_hash = md5( $content );
+			$content_key = $extension . '|' . $content_hash;
+			if ( isset( $content_targets[ $content_key ] ) ) {
+				$destination = $content_targets[ $content_key ];
+				$filename = basename( $destination );
+			} else {
+				$existing = self::find_existing_media_by_hash( $directory, $content_hash, $extension, $theme_root );
+				if ( $existing ) {
+					$destination = $existing;
+					$filename = basename( $destination );
+				} else {
+					$filename = sanitize_file_name( basename( $source ) );
+					if ( isset( $used[ strtolower( $directory . '/' . $filename ) ] ) ) {
+						$filename = pathinfo( $filename, PATHINFO_FILENAME ) . '-' . substr( md5( $source ), 0, 8 ) . '.' . $extension;
+					}
+					$destination = $directory . '/' . $filename;
+					if ( file_exists( $destination ) && md5_file( $destination ) !== $content_hash ) {
+						$filename = pathinfo( $filename, PATHINFO_FILENAME ) . '-' . substr( $content_hash, 0, 8 ) . '.' . $extension;
+						$destination = $directory . '/' . $filename;
+					}
+				}
+				$content_targets[ $content_key ] = $destination;
 			}
+
+			$used[ strtolower( $destination ) ] = true;
 			if ( ! file_exists( $destination ) ) {
 				$writes[ $destination ] = $content;
 			}
 			$map[ $source ] = array(
 				'absolute' => $destination,
-				'relative' => $relative_dir . '/' . $filename,
+				'relative' => ltrim( substr( wp_normalize_path( $destination ), strlen( rtrim( $theme_root, '/' ) ) ), '/' ),
 			);
 		}
 		return array( 'map' => $map, 'writes' => $writes );
 	}
 
+	private static function find_existing_media_by_hash( $directory, $hash, $extension, $theme_root = '' ) {
+		static $hash_indexes = array();
+		// Reuse media in the configured destination first, then elsewhere in the
+		// active theme. Bound file-count and bytes to avoid expensive full scans.
+		$directories = array_unique( array_filter( array( $directory, $theme_root ) ) );
+		foreach ( $directories as $scan_root ) {
+			$key = wp_normalize_path( $scan_root ) . '|' . $extension;
+			if ( ! isset( $hash_indexes[ $key ] ) ) {
+				$hash_indexes[ $key ] = array();
+				if ( is_dir( $scan_root ) ) {
+					$iterator = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $scan_root, FilesystemIterator::SKIP_DOTS ) );
+					$scanned = 0;
+					$hashed_bytes = 0;
+					foreach ( $iterator as $file ) {
+						if ( ++$scanned > 2500 || $hashed_bytes > 134217728 ) {
+							break;
+						}
+						if ( ! $file->isFile() || $file->isLink() || strtolower( $file->getExtension() ) !== $extension || $file->getSize() > self::MAX_ARCHIVE_SIZE ) {
+							continue;
+						}
+						$hashed_bytes += $file->getSize();
+						$content_hash = md5_file( $file->getPathname() );
+						if ( $content_hash ) {
+							$hash_indexes[ $key ][ $content_hash ] = wp_normalize_path( $file->getPathname() );
+						}
+					}
+				}
+			}
+			if ( isset( $hash_indexes[ $key ][ $hash ] ) ) {
+				return $hash_indexes[ $key ][ $hash ];
+			}
+		}
+		return '';
+	}
+
 	private static function extract_html_assets( $html, $html_path, $entries, $media_map ) {
+		// Drop inactive markup before scanning the source. An HTML comment can contain
+		// full obsolete sections, <script> tags and <link> tags that must not import.
+		$html = preg_replace( '/<!--.*?-->/s', '', (string) $html );
 		$styles = array();
 		$scripts = array();
 		$preserved = array();
-		$html = preg_replace_callback( '/<link\b[^>]*href=([' . "'\"" . '])([^' . "'\"" . ']+)\1[^>]*>/i', function ( $match ) use ( &$styles, &$preserved, $html_path, $entries ) {
+		$dependencies = array();
+		$html = preg_replace_callback( '/<link\b[^>]*href=([' . "'\"" . '])([^' . "'\"" . ']+)\1[^>]*>/i', function ( $match ) use ( &$styles, &$dependencies, $html_path, $entries ) {
 			$path = self::resolve_archive_reference( $html_path, $match[2] );
 			if ( $path && isset( $entries[ $path ] ) && 'css' === strtolower( pathinfo( $path, PATHINFO_EXTENSION ) ) ) {
-				$styles[] = array( 'path' => $path, 'content' => $entries[ $path ] );
+				if ( self::is_vendor_asset( $path, 'css' ) ) {
+					$dependencies[] = basename( $path );
+				} else {
+					$styles[] = array( 'path' => $path, 'content' => $entries[ $path ] );
+				}
 				return '';
 			}
-			$preserved[] = $match[0];
+			$dependencies[] = $match[2];
+			// Do not insert source document stylesheet links inside a WP template's body.
 			return '';
 		}, $html );
 		$html = preg_replace_callback( '/<style\b[^>]*>(.*?)<\/style>/is', function ( $match ) use ( &$styles, $html_path ) {
 			$styles[] = array( 'path' => $html_path, 'content' => $match[1] );
 			return '';
 		}, $html );
-		$html = preg_replace_callback( '/<script\b([^>]*)>(.*?)<\/script>/is', function ( $match ) use ( &$scripts, &$preserved, $html_path, $entries ) {
+		$html = preg_replace_callback( '/<script\b([^>]*)>(.*?)<\/script>/is', function ( $match ) use ( &$scripts, &$dependencies, $html_path, $entries ) {
 			if ( preg_match( '/\btype=([' . "'\"" . '])application\/ld\+json\1/i', $match[1] ) ) {
-				$preserved[] = $match[0];
 				return '';
 			}
 			if ( preg_match( '/\bsrc=([' . "'\"" . '])([^' . "'\"" . ']+)\1/i', $match[1], $source ) ) {
 				$path = self::resolve_archive_reference( $html_path, $source[2] );
 				if ( $path && isset( $entries[ $path ] ) && 'js' === strtolower( pathinfo( $path, PATHINFO_EXTENSION ) ) ) {
-					$scripts[] = $entries[ $path ];
+					if ( self::is_vendor_asset( $path, 'js' ) ) {
+						$dependencies[] = basename( $path );
+					} else {
+						$scripts[] = $entries[ $path ];
+					}
 					return '';
 				}
-				$preserved[] = $match[0];
-				return '';
+				$dependencies[] = $source[2];
+				return ''; // External JavaScript must be handled by WordPress' enqueue system.
 			}
 			if ( '' !== trim( $match[2] ) ) {
 				$scripts[] = $match[2];
@@ -406,31 +509,306 @@ PHP;
 			$html = preg_replace( '/<!doctype[^>]*>|<\/?(?:html|head)\b[^>]*>/i', '', $html );
 		}
 		$html = preg_replace( '/<\?(?:php|=)?.*?\?>/is', '', $html );
-		$html = implode( "\n", $preserved ) . "\n" . $html;
-		return array( 'html' => $html, 'styles' => $styles, 'scripts' => $scripts );
+		// JSON-LD is document-level metadata and must not be injected inside <main>.
+		$html = trim( $html );
+		return array( 'html' => $html, 'styles' => $styles, 'scripts' => $scripts, 'dependencies' => $dependencies );
 	}
 
-	private static function build_css( $styles, $entries, $media_map ) {
+	private static function collect_body_usage_context( $html ) {
+		$usage = array( 'tags' => array(), 'ids' => array(), 'classes' => array(), 'attrs' => array() );
+		if ( ! class_exists( 'DOMDocument' ) ) {
+			// Test harness / constrained servers: collect conservative attributes without DOM.
+			if ( preg_match_all( '/<([a-z][a-z0-9-]*)\b([^>]*)>/i', $html, $elements, PREG_SET_ORDER ) ) {
+				foreach ( $elements as $element ) {
+					$usage['tags'][ strtolower( $element[1] ) ] = true;
+					if ( preg_match_all( '/([a-z_:][a-z0-9_:.-]*)\s*=\s*["\']([^"\']*)["\']/i', $element[2], $attributes, PREG_SET_ORDER ) ) {
+						foreach ( $attributes as $attribute ) {
+							$name = strtolower( $attribute[1] );
+							$usage['attrs'][ $name ] = true;
+							if ( 'id' === $name ) $usage['ids'][ $attribute[2] ] = true;
+							if ( 'class' === $name ) foreach ( preg_split( '/\s+/', trim( $attribute[2] ) ) as $class ) if ( $class ) $usage['classes'][ $class ] = true;
+						}
+					}
+				}
+			}
+			return $usage;
+		}
+		libxml_use_internal_errors( true );
+		$document = new DOMDocument( '1.0', 'UTF-8' );
+		$document->loadHTML( '<?xml encoding="utf-8" ?><!doctype html><html><body><div id="tab-import-root">' . $html . '</div></body></html>', LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD );
+		libxml_clear_errors();
+		$xpath = new DOMXPath( $document );
+		$root = $xpath->query( '//*[@id="tab-import-root"]' )->item( 0 );
+		if ( ! $root ) {
+			return $usage;
+		}
+		foreach ( $xpath->query( './/*', $root ) as $node ) {
+			if ( ! $node instanceof DOMElement ) {
+				continue;
+			}
+			$usage['tags'][ strtolower( $node->tagName ) ] = true;
+			if ( $node->hasAttribute( 'id' ) && '' !== trim( $node->getAttribute( 'id' ) ) ) {
+				$usage['ids'][ trim( $node->getAttribute( 'id' ) ) ] = true;
+			}
+			if ( $node->hasAttribute( 'class' ) ) {
+				foreach ( preg_split( '/\s+/', trim( $node->getAttribute( 'class' ) ) ) as $class ) {
+					if ( '' !== $class ) {
+						$usage['classes'][ $class ] = true;
+					}
+				}
+			}
+			foreach ( $node->attributes as $attribute ) {
+				$usage['attrs'][ strtolower( $attribute->name ) ] = true;
+			}
+		}
+		return $usage;
+	}
+
+	private static function is_vendor_asset( $path, $type ) {
+		$name = strtolower( basename( $path ) );
+		// Vendor bundles must be managed as dependencies, not appended to a template's shared files.
+		return (bool) preg_match( '/^(?:bootstrap|jquery(?:-|\.)|owl[.-]carousel|font[-.]awesome|all(?:\.min)?\.css|normalize|reset|slick|swiper|popper)(?:[.-]|$)/i', $name );
+	}
+
+	private static function referenced_media( $body, $html_path, $styles, $usage, $scripts, $entries ) {
+		$needed = array();
+		$collect = static function ( $source, $content ) use ( &$needed, $entries ) {
+			if ( preg_match_all( '/(?:src|poster|href)\s*=\s*["\']([^"\']+)["\']|url\(\s*["\']?([^\)"\']+)/i', $content, $matches, PREG_SET_ORDER ) ) {
+				foreach ( $matches as $found ) {
+					$reference = ! empty( $found[1] ) ? $found[1] : ( isset( $found[2] ) ? $found[2] : '' );
+					$path = self::resolve_archive_reference( $source, $reference );
+					if ( $path && isset( $entries[ $path ] ) ) {
+						$needed[ $path ] = true;
+					}
+				}
+			}
+			if ( preg_match_all( '/srcset\s*=\s*["\']([^"\']+)["\']/i', $content, $sets ) ) {
+				foreach ( $sets[1] as $srcset ) {
+					foreach ( explode( ',', $srcset ) as $candidate ) {
+						$parts = preg_split( '/\s+/', trim( $candidate ) );
+						$path = self::resolve_archive_reference( $source, $parts[0] );
+						if ( $path && isset( $entries[ $path ] ) ) {
+							$needed[ $path ] = true;
+						}
+					}
+				}
+			}
+		};
+		$collect( $html_path, $body );
+		foreach ( $styles as $style ) {
+			$filtered = self::filter_css_for_usage( $style['content'], $usage );
+			$collect( $style['path'], $filtered );
+		}
+		// Explicit local media paths in selected scripts (e.g. an image swapped by JS).
+		foreach ( $scripts as $script ) {
+			if ( ! self::script_targets_usage( $script, $usage ) ) {
+				continue;
+			}
+			foreach ( $entries as $path => $content ) {
+				if ( preg_match( '/\.(?:jpe?g|png|webp|avif|svg|gif|ico)$/i', $path ) && strpos( $script, basename( $path ) ) !== false ) {
+					$needed[ $path ] = true;
+				}
+			}
+		}
+		return $needed;
+	}
+
+	private static function build_css( $styles, $media_map, $usage, $slug = '' ) {
 		$combined = '';
 		foreach ( $styles as $style ) {
+			$content = self::filter_css_for_usage( $style['content'], $usage );
+			if ( '' === trim( $content ) ) {
+				continue;
+			}
 			$content = preg_replace_callback( '/url\(\s*(["\']?)([^"\')]+)\1\s*\)/i', function ( $match ) use ( $style, $media_map ) {
 				$path = self::resolve_archive_reference( $style['path'], $match[2] );
 				if ( $path && isset( $media_map[ $path ] ) ) {
 					return 'url("' . esc_url_raw( get_theme_file_uri( $media_map[ $path ]['relative'] ) ) . '")';
 				}
 				return $match[0];
-			}, $style['content'] );
-			$combined .= "\n" . trim( $content ) . "\n";
+			}, $content );
+			$combined .= "\n" . $content . "\n";
 		}
-		return trim( $combined );
+		$combined = trim( $combined );
+		return $slug && $combined ? self::scope_css( $combined, $slug ) : $combined;
 	}
 
-	private static function build_js( $scripts, $slug ) {
-		if ( empty( $scripts ) ) {
+	private static function filter_css_for_usage( $css, $usage ) {
+		$css = trim( preg_replace( '#/\*.*?\*/#s', '', (string) $css ) );
+		if ( '' === $css ) {
 			return '';
 		}
-		$source = implode( "\n\n", array_map( 'trim', $scripts ) );
+		$length = strlen( $css );
+		$cursor = 0;
+		$output = '';
+		$deferred = array();
+		while ( $cursor < $length ) {
+			$open = strpos( $css, '{', $cursor );
+			if ( false === $open ) break;
+			$selector = trim( substr( $css, $cursor, $open - $cursor ) );
+			$depth = 1;
+			$close = $open + 1;
+			$quote = '';
+			while ( $close < $length && $depth > 0 ) {
+				$char = $css[ $close ];
+				if ( $quote ) {
+					if ( $char === $quote && ( 0 === $close || '\\' !== $css[ $close - 1 ] ) ) $quote = '';
+				} elseif ( '"' === $char || "'" === $char ) {
+					$quote = $char;
+				} elseif ( '{' === $char ) {
+					$depth++;
+				} elseif ( '}' === $char ) {
+					$depth--;
+				}
+				$close++;
+			}
+			if ( $depth > 0 ) break;
+			$body = trim( substr( $css, $open + 1, $close - $open - 2 ) );
+			$cursor = $close;
+			if ( '' === $selector || '' === $body ) continue;
+			if ( preg_match( '/^@(media|supports|layer|container)\b/i', $selector ) ) {
+				$nested = self::filter_css_for_usage( $body, $usage );
+				if ( $nested ) $output .= $selector . " {\n" . $nested . "\n}\n";
+				continue;
+			}
+			if ( preg_match( '/^@(font-face|keyframes|[-a-z]+keyframes|property)\b/i', $selector ) ) {
+				$deferred[] = array( $selector, $body );
+				continue;
+			}
+			if ( '@' === $selector[0] ) continue; // No global @import or unknown at-rule injection.
+			$matches = array();
+			foreach ( explode( ',', $selector ) as $segment ) {
+				$segment = trim( $segment );
+				if ( $segment && self::selector_targets_usage( $segment, $usage ) ) $matches[] = $segment;
+			}
+			if ( $matches ) $output .= implode( ', ', $matches ) . " {\n" . $body . "\n}\n";
+		}
+		foreach ( $deferred as $rule ) {
+			if ( preg_match( '/^@(?:[-a-z]+)?keyframes\s+([\w-]+)/i', $rule[0], $match ) ) {
+				if ( ! preg_match( '/\banimation(?:-name)?\s*:[^;}]*(?<![\w-])' . preg_quote( $match[1], '/' ) . '(?![\w-])/i', $output ) ) continue;
+			} elseif ( preg_match( '/^@font-face\b/i', $rule[0] ) ) {
+				if ( ! preg_match( '/font-family\s*:\s*(["\']?)([^;"\']+)\1/i', $rule[1], $match ) ) continue;
+				if ( ! preg_match( '/font-family\s*:[^;}]*' . preg_quote( trim( $match[2] ), '/' ) . '/i', $output ) ) continue;
+			} else continue;
+			$output .= $rule[0] . " {\n" . $rule[1] . "\n}\n";
+		}
+		return trim( $output );
+	}
+
+	private static function selector_targets_usage( $selector, $usage ) {
+		// Avoid importing document-wide reset / global styles just because body exists.
+		if ( preg_match( '/^(?:\s*(?::root|html|body|\*)\s*)+$/i', trim( $selector ) ) ) {
+			return false;
+		}
+		// Every explicit ID/class in a selector must exist in the retained template.
+		// A single common class in an unrelated component is not enough.
+		$selector = preg_replace( '/::?[a-zA-Z-]+(?:\([^()]*\))?/', '', trim( $selector ) );
+		if ( preg_match_all( '/#([a-zA-Z0-9_-]+)/', $selector, $ids ) ) {
+			foreach ( $ids[1] as $id ) if ( ! isset( $usage['ids'][ $id ] ) ) return false;
+		}
+		if ( preg_match_all( '/\.([a-zA-Z0-9_-]+)/', $selector, $classes ) ) {
+			foreach ( $classes[1] as $class ) if ( ! isset( $usage['classes'][ $class ] ) ) return false;
+		}
+		if ( preg_match_all( '/\[\s*([a-zA-Z0-9_-]+)/', $selector, $attributes ) ) {
+			foreach ( $attributes[1] as $attribute ) if ( ! isset( $usage['attrs'][ strtolower( $attribute ) ] ) ) return false;
+		}
+		$tag_selector = preg_replace( '/[#.][a-zA-Z0-9_-]+|\[[^\]]+\]/', ' ', $selector );
+		if ( preg_match_all( '/\b([a-z][a-z0-9-]*)\b/i', $tag_selector, $tags ) ) {
+			foreach ( $tags[1] as $tag ) {
+				if ( in_array( strtolower( $tag ), array( 'html', 'body', 'root' ), true ) ) continue;
+				if ( ! isset( $usage['tags'][ strtolower( $tag ) ] ) ) return false;
+			}
+		}
+		return true;
+	}
+
+	private static function scope_css( $css, $slug ) {
+		$root = '#tab-template-' . sanitize_title( $slug );
+		$output = '';
+		$cursor = 0;
+		$length = strlen( $css );
+		while ( $cursor < $length ) {
+			$open = strpos( $css, '{', $cursor );
+			if ( false === $open ) break;
+			$selector = trim( substr( $css, $cursor, $open - $cursor ) );
+			$depth = 1;
+			$close = $open + 1;
+			$quote = '';
+			while ( $close < $length && $depth ) {
+				$char = $css[ $close ];
+				if ( $quote ) {
+					if ( $char === $quote && '\\' !== $css[ $close - 1 ] ) $quote = '';
+				} elseif ( '"' === $char || "'" === $char ) {
+					$quote = $char;
+				} elseif ( '{' === $char ) $depth++;
+				elseif ( '}' === $char ) $depth--;
+				$close++;
+			}
+			if ( $depth ) break;
+			$body = trim( substr( $css, $open + 1, $close - $open - 2 ) );
+			$cursor = $close;
+			if ( '' === $selector || '' === $body ) continue;
+			if ( preg_match( '/^@(media|supports|layer|container)\b/i', $selector ) ) {
+				$nested = self::scope_css( $body, $slug );
+				if ( $nested ) $output .= $selector . " {\n" . $nested . "\n}\n";
+			} elseif ( '@' === $selector[0] ) {
+				// Preserve animation and font-face internals, never scope keyframe steps.
+				$output .= $selector . " {\n" . $body . "\n}\n";
+			} else {
+				$parts = array();
+				foreach ( explode( ',', $selector ) as $part ) {
+					$part = trim( $part );
+					$part = preg_replace( '/^(?:html\s+)?body(?=\s|\.|#|\[|:|$)/i', $root, $part );
+					$part = preg_replace( '/^:root\b/', $root, $part );
+					if ( '' !== $part ) $parts[] = 0 === strpos( $part, $root ) ? $part : $root . ' ' . $part;
+				}
+				if ( $parts ) $output .= implode( ', ', $parts ) . " {\n" . $body . "\n}\n";
+			}
+		}
+		return trim( $output );
+	}
+
+	private static function build_js( $scripts, $slug, $usage, &$skipped = 0 ) {
+		$selected = array();
+		$skipped = 0;
+		foreach ( $scripts as $script ) {
+			$script = trim( (string) $script );
+			if ( $script && self::script_targets_usage( $script, $usage ) ) {
+				if ( ! in_array( $script, $selected, true ) ) $selected[] = $script;
+			} elseif ( $script ) {
+				$skipped++;
+			}
+		}
+		if ( ! $selected ) return '';
+		$source = implode( "\n\n", $selected );
 		return "(function () {\n\t'use strict';\n\tfunction tabImportedTemplateInit() {\n\t\tif (!document.getElementById('tab-template-" . esc_js( $slug ) . "')) return;\n" . $source . "\n\t}\n\tif (document.readyState === 'loading') {\n\t\tdocument.addEventListener('DOMContentLoaded', tabImportedTemplateInit);\n\t} else {\n\t\ttabImportedTemplateInit();\n\t}\n}());";
+	}
+
+	private static function script_targets_usage( $script, $usage ) {
+		$selectors = array();
+		if ( preg_match_all( '/(?:querySelector(?:All)?|closest|matches)\(\s*(["\'])(.*?)\1\s*\)/s', $script, $matches ) ) {
+			$selectors = array_merge( $selectors, $matches[2] );
+		}
+		if ( preg_match_all( '/getElementById\(\s*["\']([\w-]+)["\']\s*\)/', $script, $ids ) ) {
+			foreach ( $ids[1] as $id ) $selectors[] = '#' . $id;
+		}
+		if ( preg_match_all( '/getElementsByClassName\(\s*["\']([\w-]+)["\']\s*\)/', $script, $classes ) ) {
+			foreach ( $classes[1] as $class ) $selectors[] = '.' . $class;
+		}
+		if ( preg_match_all( '/(?:jQuery|\$)\(\s*(["\'])(.*?)\1\s*\)/s', $script, $jq_matches ) ) {
+			$selectors = array_merge( $selectors, $jq_matches[2] );
+		}
+		if ( ! $selectors ) return false;
+		$matched = false;
+		foreach ( $selectors as $selector ) {
+			$segments = array_filter( array_map( 'trim', explode( ',', $selector ) ) );
+			foreach ( $segments as $segment ) {
+				// Unknown selectors indicate the script mixes unrelated page logic.
+				if ( ! self::selector_targets_usage( $segment, $usage ) ) return false;
+				$matched = true;
+			}
+		}
+		return $matched;
 	}
 
 	private static function rewrite_html_media( $html, $html_path, $media_map ) {
@@ -472,7 +850,34 @@ PHP;
 		if ( false !== strpos( $current, $start ) ) {
 			throw new RuntimeException( sprintf( __( '%s already contains this template block.', 'theme-agent-blueprint' ), $type ) );
 		}
-		return rtrim( $current ) . "\n\n" . $start . "\n" . trim( $content ) . "\n" . $end . "\n";
+
+		$payload = trim( $content );
+		if ( '' === $payload || self::asset_payload_exists( $current, $payload, $type ) ) {
+			return array( 'content' => $current, 'appended' => false );
+		}
+
+		return array(
+			'content'  => rtrim( $current ) . "\n\n" . $start . "\n" . $payload . "\n" . $end . "\n",
+			'appended' => true,
+		);
+	}
+
+	private static function asset_payload_exists( $current, $payload, $type ) {
+		if ( false !== strpos( $current, $payload ) ) {
+			return true;
+		}
+		$current_norm = self::normalize_asset_payload( $current, $type );
+		$payload_norm = self::normalize_asset_payload( $payload, $type );
+		return '' !== $payload_norm && false !== strpos( $current_norm, $payload_norm );
+	}
+
+	private static function normalize_asset_payload( $content, $type ) {
+		$content = (string) $content;
+		if ( 'CSS' === $type ) {
+			$content = preg_replace( '#/\*.*?\*/#s', '', $content );
+		}
+		$content = preg_replace( '/\s+/', '', $content );
+		return strtolower( trim( $content ) );
 	}
 
 	private static function asset_target( $configured, $fallbacks, $theme_root, $extension ) {

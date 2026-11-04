@@ -1,5 +1,10 @@
 <?php
 
+if ( ! class_exists( 'DOMDocument' ) ) {
+	echo 'SKIP: PHP DOM extension is required for dynamic template tests.' . PHP_EOL;
+	exit( 0 );
+}
+
 define( 'ABSPATH', dirname( __DIR__, 4 ) . '/' );
 
 function __( $text, $domain = null ) {
@@ -131,8 +136,8 @@ if ( false === json_encode( $result['field_group'] ) ) {
 	$failures[] = 'Field group is not JSON encodable.';
 }
 $field_types = array_column( $result['field_group']['fields'], 'type', 'name' );
-if ( ! isset( $field_types['hero_title'] ) || 'textarea' !== $field_types['hero_title'] ) {
-	$failures[] = 'An explicit field name was not preserved.';
+if ( ! isset( $field_types['hero_title'] ) || 'wysiwyg' !== $field_types['hero_title'] ) {
+	$failures[] = 'An explicit heading field with inline markup was not mapped to WYSIWYG.';
 }
 if ( ! isset( $field_types['course_guide'] ) || 'file' !== $field_types['course_guide'] ) {
 	$failures[] = 'An explicit file field was not generated.';

@@ -1,9 +1,9 @@
 === Theme Agent Blueprint ===
-Contributors: internal
-Tags: developer-tools, themes, markdown, admin
+Contributors: darshitrajyaguru97
+Tags: developer-tools, themes, custom-fields, templates, template-importer
 Requires at least: 6.2
 Requires PHP: 7.4
-Stable tag: 1.6.1
+Stable tag: 1.7.1
 License: GPLv2 or later
 
 Create a project-specific Markdown playbook and import packaged HTML designs into the active WordPress theme.
@@ -23,7 +23,7 @@ Create a project-specific Markdown playbook and import packaged HTML designs int
 4. Choose Static HTML content or Dynamic SCF / ACF fields, then upload the ZIP.
 5. Review the generated PHP template and, for dynamic mode, its SCF/ACF JSON field group. Assign the template to a page in WordPress.
 
-The source HTML header and footer are excluded in both modes so the active theme's get_header() and get_footer() output remains authoritative. Static mode keeps page content in the generated PHP template. Dynamic mode converts headings, text, images, links, and annotated file downloads into typed SCF/ACF fields. Repeated card, testimonial, logo, FAQ, step, and similar structures become repeater fields. Source content remains as a frontend fallback until fields are populated.
+Inactive HTML comments (including commented-out legacy sections) and source HTML header and footer are excluded in both modes so the active theme's get_header() and get_footer() output remains authoritative. Static mode keeps page content in the generated PHP template. Dynamic mode converts headings, text, images, links, and annotated file downloads into typed SCF/ACF fields. Repeated card, testimonial, logo, FAQ, step, and similar structures become repeater fields. Source content remains as a frontend fallback until fields are populated.
 
 Dynamic fields are inferred automatically. Repeated steps, fields, choices, cards, and similar sibling structures become one repeater with typed image, text, textarea, link, file, and URL subfields. For deterministic names or specialized types, add `data-tab-field="field_name"` to an editable HTML element and optionally add `data-tab-type="text|textarea|wysiwyg|image|file|link|url"`. For example, `<a href="guide.pdf" data-tab-field="course_guide" data-tab-type="file">Download guide</a>` creates a file-upload field. URL-bearing buttons retain their button markup and receive a URL field. These authoring attributes are removed from generated frontend markup.
 
@@ -37,7 +37,7 @@ When inference needs project-specific intent, use these source HTML annotations:
 
 Annotations are authoring metadata and are removed from generated frontend HTML. Existing generated templates and JSON are snapshots; revoke and re-import them to rebuild with newer generation rules.
 
-Imported CSS and JavaScript are appended to the configured existing shared files between named markers. Media is copied into the configured shared directories, and local URLs are rewritten to active-theme URLs. The importer never creates template-named CSS, JavaScript, or media directories. The generated field-group JSON is saved in the configured SCF/ACF JSON directory.
+Only selected template-related CSS rules and JavaScript blocks are appended to the configured existing shared files between named markers; imported CSS is scoped to the template container. Scripts whose selectors cannot be linked safely to the retained page are skipped with a warning. External libraries and vendor bundles are not merged; the active theme must enqueue any needed dependencies. Only media referenced by retained template markup, selected CSS, or selected JavaScript is copied into the configured shared directories; identical existing assets are reused within the active theme (subject to a bounded scan), and local URLs are rewritten to active-theme URLs. The importer never creates template-named CSS, JavaScript, or media directories. The generated field-group JSON is saved in the configured SCF/ACF JSON directory.
 
 == Template history ==
 Every new import creates a History record and a private restore snapshot. The History tab can revoke the generated PHP template, optional field-group JSON, imported media, and the template's marked CSS/JavaScript blocks in one action. Revoked imports remain available for one-click restore.
@@ -58,9 +58,18 @@ History is prefetched through a lightweight authenticated AJAX fragment and both
 - Use HTTPS for the WordPress admin and keep WordPress/plugins/themes updated.
 
 == Notes ==
-SCF or ACF is required to edit generated custom fields. Field inference is structural: common content and repeated UI patterns are converted automatically, but business data sources, API queries, taxonomies, and application-specific JavaScript cannot be inferred reliably from visual HTML alone. Verify the generated template in a staging environment and keep theme files under version control.
+The PHP DOM extension is required for both template import modes. SCF or ACF is required to edit generated custom fields. Field inference is structural: common content and repeated UI patterns are converted automatically, but business data sources, API queries, taxonomies, and application-specific JavaScript cannot be inferred reliably from visual HTML alone. Verify the generated template in a staging environment and keep theme files under version control.
 
 == Changelog ==
+= 1.7.1 =
+* Removed inactive commented-out HTML sections before asset discovery, and filtered imported CSS to retained page selectors only. CSS is scoped to its template container.
+* Filtered imported JavaScript using body selector/id/class targeting heuristics before shared-file merge. Unrelated or ambiguous scripts are skipped with notices; required vendor assets must be loaded by the theme.
+* Copied only referenced image/font assets and reused existing matching media by content hash; unrelated ZIP assets are excluded.
+* Skipped shared CSS/JavaScript append when equivalent payload already exists in the destination file.
+* Improved dynamic field labels with context-aware naming and mapped rich inline heading content to WYSIWYG fields.
+* Upgraded progress overlays with richer wave, ripple, bubble, and glow animation and applied loading feedback to save/revoke/restore actions.
+* Added importer fixture regressions for CSS/JS scoping and referenced-only asset reuse, plus a DOM-dependent HTML source-order regression.
+
 = 1.6.1 =
 * Fixed hidden action inputs shadowing the form action URL and causing [object HTMLInputElement] requests.
 * Kept successful and failed import results on the current Project view without opening a new tab.
